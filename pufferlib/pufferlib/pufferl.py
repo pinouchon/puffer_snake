@@ -216,17 +216,20 @@ class PuffeRL:
         self.last_log_time = time.time()
         self.start_time = time.time()
         self.utilization = Utilization()
-        self.profile = Profile()
+        self.profile = Profile(frequency=int(config.get('profile_frequency', 5)))
         self.stats = defaultdict(list)
         self.last_stats = defaultdict(list)
         self.losses = {}
         self.last_eval_s = 0.0
         self.last_train_s = 0.0
         self.last_update_s = 0.0
+        self.live_log_interval_s = float(config.get('live_log_interval_s', 0.25))
+        self.dashboard_enabled = bool(config.get('dashboard', True))
 
         # Dashboard
         self.model_size = sum(p.numel() for p in policy.parameters() if p.requires_grad)
-        self.print_dashboard(clear=True)
+        if self.dashboard_enabled:
+            self.print_dashboard(clear=True)
 
     @property
     def uptime(self):
@@ -494,10 +497,11 @@ class PuffeRL:
         self.last_train_s = time.perf_counter() - tick
         self.last_update_s = self.last_eval_s + self.last_train_s
         done_training = self.global_step >= config['total_timesteps']
-        if done_training or self.global_step == 0 or time.time() > self.last_log_time + 0.25:
+        if done_training or self.global_step == 0 or time.time() > self.last_log_time + self.live_log_interval_s:
             logs = self.mean_and_log()
             self.losses = losses
-            self.print_dashboard()
+            if self.dashboard_enabled:
+                self.print_dashboard()
             self.stats = defaultdict(list)
             self.last_log_time = time.time()
             self.last_log_step = self.global_step
@@ -813,6 +817,9 @@ class Profile:
         return self.profiles[name]
 
     def __call__(self, name, epoch, nest=False):
+        if self.frequency <= 0:
+            return
+
         # Skip profiling the first few epochs, which are noisy due to setup
         if (epoch + 1) % self.frequency != 0:
             return
@@ -835,6 +842,9 @@ class Profile:
         profile['elapsed'] += delta * self.frequency
 
     def end(self):
+        if self.frequency <= 0:
+            return
+
         if torch.cuda.is_available():
             torch.cuda.synchronize()
 
@@ -843,6 +853,9 @@ class Profile:
             self.pop(end)
 
     def clear(self):
+        if self.frequency <= 0:
+            return
+
         for prof in self.profiles.values():
             if prof['delta'] > 0:
                 prof['buffer'] = prof['delta']
@@ -1130,7 +1143,8 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None, early_stop
         _write_periodic_stats(logs)
         all_logs.append(logs)
 
-    pufferl.print_dashboard()
+    if pufferl.dashboard_enabled:
+        pufferl.print_dashboard()
     model_path = pufferl.close()
     pufferl.logger.close(model_path, early_stop=False)
     return all_logs

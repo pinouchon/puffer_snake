@@ -114,6 +114,8 @@ Current best valid single-GPU configuration:
 - `vec.backend = PufferEnv`
 - `vec.num_envs = 1`
 - `env.num_envs = 3072`
+- `env.report_interval = 128`
+- `policy_name = SingleSnakeV1HybridHeuristicPolicy`
 - `train.learning_rate = 0.0022`
 - `train.anneal_lr = False`
 - `train.update_epochs = 1`
@@ -123,8 +125,8 @@ Current best valid single-GPU configuration:
 
 Validated result:
 
-- replicated time-to-50 runs: `19.96s`, `20.19s`, `22.02s`
-- median time-to-50: about `20.19s`
+- replicated time-to-50 runs: `18.79s`, `20.60s`, `19.27s`
+- median time-to-50: about `19.27s`
 - all validation runs reached `score >= 50` before `100_000_000` timesteps
 
 ## Notes

@@ -467,6 +467,483 @@ class SingleSnakeV1ResidualPolicy(nn.Module):
         value = self.value_fn(hidden)
         return action, value
 
+
+class SingleSnakeV1DualHeadPolicy(nn.Module):
+    def __init__(self, env, cnn_channels=32, hidden_size=128, **kwargs):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.is_continuous = False
+        self.obs_shape = env.single_observation_space.shape
+        self.num_obs_classes = int(np.max(env.single_observation_space.high)) + 1
+
+        self.backbone = nn.Sequential(
+            pufferlib.pytorch.layer_init(
+                nn.Conv2d(self.num_obs_classes, cnn_channels, kernel_size=3, padding=1)),
+            nn.GELU(),
+            pufferlib.pytorch.layer_init(
+                nn.Conv2d(cnn_channels, cnn_channels, kernel_size=3, padding=1)),
+            nn.GELU(),
+            nn.Flatten(),
+        )
+        with torch.no_grad():
+            dummy = torch.zeros(1, self.num_obs_classes, *self.obs_shape)
+            conv_dim = int(self.backbone(dummy).shape[-1])
+
+        self.encoder = nn.Sequential(
+            pufferlib.pytorch.layer_init(nn.Linear(conv_dim, hidden_size)),
+            nn.GELU(),
+            nn.LayerNorm(hidden_size),
+        )
+        self.actor_head = nn.Sequential(
+            pufferlib.pytorch.layer_init(nn.Linear(hidden_size, hidden_size)),
+            nn.GELU(),
+        )
+        self.value_head = nn.Sequential(
+            pufferlib.pytorch.layer_init(nn.Linear(hidden_size, hidden_size)),
+            nn.GELU(),
+        )
+        self.actor = pufferlib.pytorch.layer_init(
+            nn.Linear(hidden_size, env.single_action_space.n), std=0.01)
+        self.value_fn = pufferlib.pytorch.layer_init(
+            nn.Linear(hidden_size, 1), std=1)
+
+    def forward(self, observations, state=None):
+        hidden = self.encode_observations(observations)
+        actions, value = self.decode_actions(hidden)
+        return actions, value
+
+    def forward_eval(self, observations, state=None):
+        return self.forward(observations, state)
+
+    def forward_train(self, observations, state=None):
+        return self.forward(observations, state)
+
+    def encode_observations(self, observations, state=None):
+        observations = F.one_hot(
+            observations.long(), self.num_obs_classes).permute(0, 3, 1, 2).float()
+        hidden = self.backbone(observations)
+        return self.encoder(hidden)
+
+    def decode_actions(self, hidden):
+        action = self.actor(self.actor_head(hidden))
+        value = self.value_fn(self.value_head(hidden))
+        return action, value
+
+
+class SingleSnakeV1CoordPolicy(nn.Module):
+    def __init__(self, env, cnn_channels=24, hidden_size=128, **kwargs):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.is_continuous = False
+        self.obs_shape = env.single_observation_space.shape
+        self.height, self.width = self.obs_shape
+
+        coord_y = torch.linspace(-1.0, 1.0, self.height).view(1, 1, self.height, 1)
+        coord_x = torch.linspace(-1.0, 1.0, self.width).view(1, 1, 1, self.width)
+        self.register_buffer('coord_y', coord_y, persistent=False)
+        self.register_buffer('coord_x', coord_x, persistent=False)
+
+        in_channels = 5  # head, body, food, y, x
+        self.backbone = nn.Sequential(
+            pufferlib.pytorch.layer_init(
+                nn.Conv2d(in_channels, cnn_channels, kernel_size=3, padding=1)),
+            nn.GELU(),
+            pufferlib.pytorch.layer_init(
+                nn.Conv2d(cnn_channels, cnn_channels, kernel_size=3, padding=1)),
+            nn.GELU(),
+            nn.Flatten(),
+        )
+        with torch.no_grad():
+            dummy = torch.zeros(1, in_channels, *self.obs_shape)
+            conv_dim = int(self.backbone(dummy).shape[-1])
+
+        self.encoder = nn.Sequential(
+            pufferlib.pytorch.layer_init(nn.Linear(conv_dim, hidden_size)),
+            nn.GELU(),
+        )
+        self.actor = pufferlib.pytorch.layer_init(
+            nn.Linear(hidden_size, env.single_action_space.n), std=0.01)
+        self.value_fn = pufferlib.pytorch.layer_init(
+            nn.Linear(hidden_size, 1), std=1)
+
+    def forward(self, observations, state=None):
+        hidden = self.encode_observations(observations)
+        actions, value = self.decode_actions(hidden)
+        return actions, value
+
+    def forward_eval(self, observations, state=None):
+        return self.forward(observations, state)
+
+    def forward_train(self, observations, state=None):
+        return self.forward(observations, state)
+
+    def encode_observations(self, observations, state=None):
+        observations = observations.long()
+        head = (observations == 2).float().unsqueeze(1)
+        body = (observations == 3).float().unsqueeze(1)
+        food = (observations == 1).float().unsqueeze(1)
+        batch = observations.shape[0]
+        coord_y = self.coord_y.expand(batch, -1, -1, self.width)
+        coord_x = self.coord_x.expand(batch, -1, self.height, -1)
+        hidden = torch.cat([head, body, food, coord_y, coord_x], dim=1)
+        hidden = self.backbone(hidden)
+        return self.encoder(hidden)
+
+    def decode_actions(self, hidden):
+        action = self.actor(hidden)
+        value = self.value_fn(hidden)
+        return action, value
+
+
+class SingleSnakeV1FeaturePolicy(nn.Module):
+    def __init__(self, env, cnn_channels=24, hidden_size=128, **kwargs):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.is_continuous = False
+        self.obs_shape = env.single_observation_space.shape
+        self.height, self.width = self.obs_shape
+
+        coord_y = torch.linspace(-1.0, 1.0, self.height).view(1, 1, self.height, 1)
+        coord_x = torch.linspace(-1.0, 1.0, self.width).view(1, 1, 1, self.width)
+        self.register_buffer('coord_y', coord_y, persistent=False)
+        self.register_buffer('coord_x', coord_x, persistent=False)
+
+        map_channels = 5  # head, body, food, y, x
+        self.backbone = nn.Sequential(
+            pufferlib.pytorch.layer_init(
+                nn.Conv2d(map_channels, cnn_channels, kernel_size=3, padding=1)),
+            nn.GELU(),
+            pufferlib.pytorch.layer_init(
+                nn.Conv2d(cnn_channels, cnn_channels, kernel_size=3, padding=1)),
+            nn.GELU(),
+            nn.Flatten(),
+        )
+        with torch.no_grad():
+            dummy = torch.zeros(1, map_channels, *self.obs_shape)
+            conv_dim = int(self.backbone(dummy).shape[-1])
+
+        scalar_dim = 7  # head y/x, food y/x, delta y/x, occupancy
+        self.encoder = nn.Sequential(
+            pufferlib.pytorch.layer_init(nn.Linear(conv_dim + scalar_dim, hidden_size)),
+            nn.GELU(),
+        )
+        self.actor = pufferlib.pytorch.layer_init(
+            nn.Linear(hidden_size, env.single_action_space.n), std=0.01)
+        self.value_fn = pufferlib.pytorch.layer_init(
+            nn.Linear(hidden_size, 1), std=1)
+
+    def forward(self, observations, state=None):
+        hidden = self.encode_observations(observations)
+        actions, value = self.decode_actions(hidden)
+        return actions, value
+
+    def forward_eval(self, observations, state=None):
+        return self.forward(observations, state)
+
+    def forward_train(self, observations, state=None):
+        return self.forward(observations, state)
+
+    def encode_observations(self, observations, state=None):
+        observations = observations.long()
+        batch = observations.shape[0]
+
+        head = (observations == 2).float()
+        body = (observations == 3).float()
+        food = (observations == 1).float()
+        occ = (head + body).clamp(max=1.0)
+
+        coord_y = self.coord_y.expand(batch, -1, -1, self.width)
+        coord_x = self.coord_x.expand(batch, -1, self.height, -1)
+        hidden = torch.cat([
+            head.unsqueeze(1),
+            body.unsqueeze(1),
+            food.unsqueeze(1),
+            coord_y,
+            coord_x,
+        ], dim=1)
+        hidden = self.backbone(hidden)
+
+        flat_head = head.view(batch, -1).float()
+        flat_food = food.view(batch, -1).float()
+        head_idx = flat_head.argmax(dim=1)
+        food_idx = flat_food.argmax(dim=1)
+        head_y = head_idx.div(self.width, rounding_mode='floor').float() / max(self.height - 1, 1)
+        head_x = head_idx.remainder(self.width).float() / max(self.width - 1, 1)
+        food_y = food_idx.div(self.width, rounding_mode='floor').float() / max(self.height - 1, 1)
+        food_x = food_idx.remainder(self.width).float() / max(self.width - 1, 1)
+        delta_y = food_y - head_y
+        delta_x = food_x - head_x
+        occupancy = occ.mean(dim=(1, 2))
+        scalars = torch.stack([
+            head_y, head_x, food_y, food_x, delta_y, delta_x, occupancy
+        ], dim=1)
+
+        hidden = torch.cat([hidden, scalars], dim=1)
+        return self.encoder(hidden)
+
+    def decode_actions(self, hidden):
+        action = self.actor(hidden)
+        value = self.value_fn(hidden)
+        return action, value
+
+
+class SingleSnakeV1HeuristicPolicy(nn.Module):
+    def __init__(self, env, hidden_size=128, **kwargs):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.is_continuous = False
+        self.obs_shape = env.single_observation_space.shape
+        self.height, self.width = self.obs_shape
+
+        feature_dim = 19
+        self.encoder = nn.Sequential(
+            pufferlib.pytorch.layer_init(nn.Linear(feature_dim, hidden_size)),
+            nn.GELU(),
+            pufferlib.pytorch.layer_init(nn.Linear(hidden_size, hidden_size)),
+            nn.GELU(),
+        )
+        self.actor = pufferlib.pytorch.layer_init(
+            nn.Linear(hidden_size, env.single_action_space.n), std=0.01)
+        self.value_fn = pufferlib.pytorch.layer_init(
+            nn.Linear(hidden_size, 1), std=1)
+
+    def forward(self, observations, state=None):
+        hidden = self.encode_observations(observations)
+        actions, value = self.decode_actions(hidden)
+        return actions, value
+
+    def forward_eval(self, observations, state=None):
+        return self.forward(observations, state)
+
+    def forward_train(self, observations, state=None):
+        return self.forward(observations, state)
+
+    def encode_observations(self, observations, state=None):
+        observations = observations.long()
+        batch = observations.shape[0]
+        width = self.width
+        height = self.height
+
+        head = observations == 2
+        body = observations == 3
+        food = observations == 1
+        occ = head | body
+
+        flat_head = head.view(batch, -1).float()
+        flat_food = food.view(batch, -1).float()
+        head_idx = flat_head.argmax(dim=1)
+        food_idx = flat_food.argmax(dim=1)
+
+        head_y = head_idx.div(width, rounding_mode='floor')
+        head_x = head_idx.remainder(width)
+        food_y = food_idx.div(width, rounding_mode='floor')
+        food_x = food_idx.remainder(width)
+
+        batch_idx = torch.arange(batch, device=observations.device)
+        up_y = (head_y - 1).clamp(min=0)
+        down_y = (head_y + 1).clamp(max=height - 1)
+        left_x = (head_x - 1).clamp(min=0)
+        right_x = (head_x + 1).clamp(max=width - 1)
+
+        wall_up = (head_y == 0).float()
+        wall_down = (head_y == height - 1).float()
+        wall_left = (head_x == 0).float()
+        wall_right = (head_x == width - 1).float()
+
+        body_up = body[batch_idx, up_y, head_x].float()
+        body_down = body[batch_idx, down_y, head_x].float()
+        body_left = body[batch_idx, head_y, left_x].float()
+        body_right = body[batch_idx, head_y, right_x].float()
+
+        danger_up = torch.maximum(wall_up, body_up)
+        danger_down = torch.maximum(wall_down, body_down)
+        danger_left = torch.maximum(wall_left, body_left)
+        danger_right = torch.maximum(wall_right, body_right)
+
+        food_up = (food_y < head_y).float()
+        food_down = (food_y > head_y).float()
+        food_left = (food_x < head_x).float()
+        food_right = (food_x > head_x).float()
+
+        head_y_norm = head_y.float() / max(height - 1, 1)
+        head_x_norm = head_x.float() / max(width - 1, 1)
+        food_y_norm = food_y.float() / max(height - 1, 1)
+        food_x_norm = food_x.float() / max(width - 1, 1)
+        delta_y = food_y_norm - head_y_norm
+        delta_x = food_x_norm - head_x_norm
+
+        dist_up = head_y.float() / max(height - 1, 1)
+        dist_down = (height - 1 - head_y).float() / max(height - 1, 1)
+        dist_left = head_x.float() / max(width - 1, 1)
+        dist_right = (width - 1 - head_x).float() / max(width - 1, 1)
+        occupancy = occ.float().mean(dim=(1, 2))
+
+        features = torch.stack([
+            head_y_norm,
+            head_x_norm,
+            food_y_norm,
+            food_x_norm,
+            delta_y,
+            delta_x,
+            danger_up,
+            danger_down,
+            danger_left,
+            danger_right,
+            food_up,
+            food_down,
+            food_left,
+            food_right,
+            dist_up,
+            dist_down,
+            dist_left,
+            dist_right,
+            occupancy,
+        ], dim=1)
+        return self.encoder(features)
+
+    def decode_actions(self, hidden):
+        action = self.actor(hidden)
+        value = self.value_fn(hidden)
+        return action, value
+
+
+class SingleSnakeV1HybridHeuristicPolicy(nn.Module):
+    def __init__(self, env, cnn_channels=16, hidden_size=128, **kwargs):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.is_continuous = False
+        self.obs_shape = env.single_observation_space.shape
+        self.height, self.width = self.obs_shape
+
+        self.conv = nn.Sequential(
+            pufferlib.pytorch.layer_init(nn.Conv2d(3, cnn_channels, kernel_size=3, padding=1)),
+            nn.GELU(),
+            pufferlib.pytorch.layer_init(nn.Conv2d(cnn_channels, cnn_channels, kernel_size=3, padding=1)),
+            nn.GELU(),
+            nn.Flatten(),
+        )
+        with torch.no_grad():
+            dummy = torch.zeros(1, 3, *self.obs_shape)
+            conv_dim = int(self.conv(dummy).shape[-1])
+
+        heuristic_dim = 19
+        self.encoder = nn.Sequential(
+            pufferlib.pytorch.layer_init(nn.Linear(conv_dim + heuristic_dim, hidden_size)),
+            nn.GELU(),
+        )
+        self.actor = pufferlib.pytorch.layer_init(
+            nn.Linear(hidden_size, env.single_action_space.n), std=0.01)
+        self.value_fn = pufferlib.pytorch.layer_init(
+            nn.Linear(hidden_size, 1), std=1)
+
+    def forward(self, observations, state=None):
+        hidden = self.encode_observations(observations)
+        actions, value = self.decode_actions(hidden)
+        return actions, value
+
+    def forward_eval(self, observations, state=None):
+        return self.forward(observations, state)
+
+    def forward_train(self, observations, state=None):
+        return self.forward(observations, state)
+
+    def _heuristics(self, observations):
+        observations = observations.long()
+        batch = observations.shape[0]
+        width = self.width
+        height = self.height
+
+        head = observations == 2
+        body = observations == 3
+        food = observations == 1
+        occ = head | body
+
+        flat_head = head.view(batch, -1).float()
+        flat_food = food.view(batch, -1).float()
+        head_idx = flat_head.argmax(dim=1)
+        food_idx = flat_food.argmax(dim=1)
+
+        head_y = head_idx.div(width, rounding_mode='floor')
+        head_x = head_idx.remainder(width)
+        food_y = food_idx.div(width, rounding_mode='floor')
+        food_x = food_idx.remainder(width)
+
+        batch_idx = torch.arange(batch, device=observations.device)
+        up_y = (head_y - 1).clamp(min=0)
+        down_y = (head_y + 1).clamp(max=height - 1)
+        left_x = (head_x - 1).clamp(min=0)
+        right_x = (head_x + 1).clamp(max=width - 1)
+
+        wall_up = (head_y == 0).float()
+        wall_down = (head_y == height - 1).float()
+        wall_left = (head_x == 0).float()
+        wall_right = (head_x == width - 1).float()
+
+        body_up = body[batch_idx, up_y, head_x].float()
+        body_down = body[batch_idx, down_y, head_x].float()
+        body_left = body[batch_idx, head_y, left_x].float()
+        body_right = body[batch_idx, head_y, right_x].float()
+
+        danger_up = torch.maximum(wall_up, body_up)
+        danger_down = torch.maximum(wall_down, body_down)
+        danger_left = torch.maximum(wall_left, body_left)
+        danger_right = torch.maximum(wall_right, body_right)
+
+        food_up = (food_y < head_y).float()
+        food_down = (food_y > head_y).float()
+        food_left = (food_x < head_x).float()
+        food_right = (food_x > head_x).float()
+
+        head_y_norm = head_y.float() / max(height - 1, 1)
+        head_x_norm = head_x.float() / max(width - 1, 1)
+        food_y_norm = food_y.float() / max(height - 1, 1)
+        food_x_norm = food_x.float() / max(width - 1, 1)
+        delta_y = food_y_norm - head_y_norm
+        delta_x = food_x_norm - head_x_norm
+
+        dist_up = head_y.float() / max(height - 1, 1)
+        dist_down = (height - 1 - head_y).float() / max(height - 1, 1)
+        dist_left = head_x.float() / max(width - 1, 1)
+        dist_right = (width - 1 - head_x).float() / max(width - 1, 1)
+        occupancy = occ.float().mean(dim=(1, 2))
+
+        return torch.stack([
+            head_y_norm,
+            head_x_norm,
+            food_y_norm,
+            food_x_norm,
+            delta_y,
+            delta_x,
+            danger_up,
+            danger_down,
+            danger_left,
+            danger_right,
+            food_up,
+            food_down,
+            food_left,
+            food_right,
+            dist_up,
+            dist_down,
+            dist_left,
+            dist_right,
+            occupancy,
+        ], dim=1)
+
+    def encode_observations(self, observations, state=None):
+        observations = observations.long()
+        head = (observations == 2).float().unsqueeze(1)
+        body = (observations == 3).float().unsqueeze(1)
+        food = (observations == 1).float().unsqueeze(1)
+        conv_hidden = self.conv(torch.cat([head, body, food], dim=1))
+        heuristics = self._heuristics(observations)
+        hidden = torch.cat([conv_hidden, heuristics], dim=1)
+        return self.encoder(hidden)
+
+    def decode_actions(self, hidden):
+        action = self.actor(hidden)
+        value = self.value_fn(hidden)
+        return action, value
+
 '''
 class Snake(pufferlib.models.Default):
     def __init__(self, env, hidden_size=128):
