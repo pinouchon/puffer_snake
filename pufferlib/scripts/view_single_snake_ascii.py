@@ -59,9 +59,9 @@ class TerminalScreen:
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Render single_snake policy as ASCII at fixed SPS")
-    parser.add_argument("--env-name", type=str, default="puffer_single_snake_v2",
-        help="Environment config name, e.g. puffer_single_snake or puffer_single_snake_v2")
+    parser = argparse.ArgumentParser(description="Render single_snake_v1 policy as ASCII at fixed SPS")
+    parser.add_argument("--env-name", type=str, default="puffer_single_snake_v1",
+        help="Environment config name, e.g. puffer_single_snake_v1")
     parser.add_argument("--checkpoint", type=str, default=None,
         help="Path to checkpoint (.pt). Defaults to latest experiments/**/model_*.pt")
     parser.add_argument("--fps", type=float, default=10.0, help="Target steps per second")
@@ -133,7 +133,7 @@ def run_loop(args):
     driver = vecenv.driver_env
 
     if not hasattr(driver, "render_ansi"):
-        raise RuntimeError("single_snake env does not expose render_ansi")
+        raise RuntimeError("selected env does not expose render_ansi")
 
     obs, _ = vecenv.reset()
     num_agents = vecenv.observation_space.shape[0]

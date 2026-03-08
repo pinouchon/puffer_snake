@@ -20,7 +20,7 @@ if ROOT_DIR not in sys.path:
 import pufferlib.pytorch
 from pufferlib import pufferl
 
-ENV_NAME = "puffer_single_snake_v3"
+ENV_NAME = "puffer_single_snake_v1"
 
 
 class TerminalSession:
@@ -96,7 +96,7 @@ def default_device():
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Render single_snake_v3 policy as ASCII at fixed FPS")
+    parser = argparse.ArgumentParser(description="Render single_snake_v1 policy as ASCII at fixed FPS")
     parser.add_argument("--checkpoint", type=str, default=None,
         help="Path to checkpoint (.pt). Defaults to latest experiments/**/model_*.pt")
     parser.add_argument("--fps", type=float, default=10.0,

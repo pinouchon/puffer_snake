@@ -1,34 +1,21 @@
-#include "single_snake.h"
+#include "single_snake_v1.h"
 
 typedef struct _object PyObject;
 static PyObject* vec_render_ansi(PyObject* self, PyObject* args);
 #define MY_METHODS {"vec_render_ansi", vec_render_ansi, METH_VARARGS, "Render vector env as ANSI text"}
 
-#define Env CSnake
+#define Env CSnakeV1
 #include "../env_binding.h"
 
-static int my_init(Env* env, PyObject* args, PyObject* kwargs) {   
-    env->width = SINGLE_SNAKE_MAP_WIDTH;
-    env->height = SINGLE_SNAKE_MAP_HEIGHT;
-    env->num_snakes = SINGLE_SNAKE_NUM_SNAKES;
-    env->vision = SINGLE_SNAKE_VISION;
-    env->leave_corpse_on_death = unpack(kwargs, "leave_corpse_on_death");
-    env->food = SINGLE_SNAKE_NUM_FOOD;
+static int my_init(Env* env, PyObject* args, PyObject* kwargs) {
+    (void)args;
+    env->width = unpack(kwargs, "width");
+    env->height = unpack(kwargs, "height");
     env->reward_food = unpack(kwargs, "reward_food");
-    env->reward_corpse = unpack(kwargs, "reward_corpse");
-    env->reward_death = unpack(kwargs, "reward_death");
     env->reward_step = unpack(kwargs, "reward_step");
-    env->use_potential_shaping = unpack(kwargs, "use_potential_shaping");
-    env->potential_shaping_coef = unpack(kwargs, "potential_shaping_coef");
+    env->reward_death = unpack(kwargs, "reward_death");
     env->max_episode_steps = unpack(kwargs, "max_episode_steps");
-    env->max_snake_length = env->width * env->height;
-    env->cell_size = unpack(kwargs, "cell_size");    
-    if (env->max_episode_steps < 0) {
-        env->max_episode_steps = 0;
-    }
-    if (env->potential_shaping_coef < 0.0f) {
-        env->potential_shaping_coef = 0.0f;
-    }
+
     init_csnake(env);
     return 0;
 }
@@ -42,14 +29,17 @@ static int my_log(PyObject* dict, Log* log) {
     return 0;
 }
 
-static char tile_to_ascii(char tile) {
-    unsigned char t = (unsigned char)tile;
-    switch (t) {
+static char tile_to_ascii(Env* env, int pos) {
+    int head_pos = env->snake[env->head_ptr];
+    if (pos == head_pos) {
+        return '@';
+    }
+
+    switch (env->grid[pos]) {
         case EMPTY: return ' ';
         case FOOD: return '*';
-        case CORPSE: return 'x';
-        case WALL: return '#';
-        default: return 'o';
+        case SNAKE_TILE: return 'o';
+        default: return '?';
     }
 }
 
@@ -106,10 +96,8 @@ static PyObject* vec_render_ansi(PyObject* self, PyObject* args) {
     size_t pos = 0;
     for (int y = 0; y < env->height; y += stride) {
         for (int x = 0; x < env->width; x += stride) {
-            int row = y + env->border;
-            int col = x + env->border;
-            char tile = env->grid[row*env->grid_width + col];
-            buffer[pos++] = tile_to_ascii(tile);
+            int cell_pos = y * env->width + x;
+            buffer[pos++] = tile_to_ascii(env, cell_pos);
         }
         buffer[pos++] = '\n';
     }

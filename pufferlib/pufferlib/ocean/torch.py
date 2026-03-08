@@ -243,7 +243,7 @@ class Snake(nn.Module):
         return action, value
 
 
-class SingleSnakeV3Policy(nn.Module):
+class SingleSnakeV1Policy(nn.Module):
     def __init__(self, env, cnn_channels=16, hidden_size=64, **kwargs):
         super().__init__()
         self.hidden_size = hidden_size
