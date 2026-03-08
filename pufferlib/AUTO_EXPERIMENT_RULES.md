@@ -113,20 +113,41 @@ Current live supported configuration:
 
 - `vec.backend = PufferEnv`
 - `vec.num_envs = 1`
-- `env.num_envs = 3072`
+- `env.num_envs = 4096`
 - `policy_name = SingleSnakeV1Policy`
-- `train.learning_rate = 0.0022`
+- `train.total_timesteps = 30_080_548`
+- `train.learning_rate = 0.0021585990625102125`
 - `train.anneal_lr = False`
+- `train.gamma = 0.9940711103165775`
+- `train.gae_lambda = 0.944`
 - `train.update_epochs = 1`
-- `train.bptt_horizon = 64`
+- `train.clip_coef = 0.1758868095026977`
+- `train.vf_coef = 0.6108216342676894`
+- `train.vf_clip_coef = 0.15470946293822643`
+- `train.max_grad_norm = 0.5087626236773275`
+- `train.bptt_horizon = 32`
 - `train.minibatch_size = 8192`
+- `train.prio_alpha = 0.5551867470045929`
+- `train.prio_beta0 = 0.38`
 - `train.recompute_advantages_per_minibatch = False`
 
 Validated result:
 
-- replicated time-to-50 runs: `19.96s`, `20.19s`, `22.02s`
-- median time-to-50: about `20.19s`
+- 5-run replicated time-to-50 runs: `15.116s`, `15.085s`, `16.752s`, `16.552s`, `16.868s`
+- median time-to-50: about `16.552s`
 - all validation runs reached `score >= 50` before `100_000_000` timesteps
+
+Runner-ups:
+
+- previous 3-run winner `gw5h6eqs`: `14.981s`, `15.510s`, `16.996s`
+  - 3-run median: about `15.510s`
+  - later 5-run revalidation did not satisfy the variance rule
+- previous baked winner `y5j8ojni`: `16.401s`, `15.467s`, `16.214s`, `16.102s`, `20.484s`
+  - 5-run median: about `16.214s`
+  - did not satisfy the variance rule on 5-run revalidation
+- closest alternative valid 5-run candidate `7vqfwun5`: `17.442s`, `17.417s`, `16.837s`, `17.984s`, `17.145s`
+  - 5-run median: about `17.417s`
+  - satisfied the variance rule, but was slower than the current winner
 
 Archived experimental winner:
 

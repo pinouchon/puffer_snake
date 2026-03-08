@@ -1101,8 +1101,10 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None, early_stop
                 f.write(json.dumps(record, sort_keys=True) + '\n')
             next_stats_log_step += stats_log_interval
 
-    # Sweep needs data for early stopped runs, so send data when steps > 100M
-    logging_threshold = min(0.20*train_config['total_timesteps'], 100_000_000)
+    # Sweeps may need the full early learning trace, not just late-stage points.
+    log_start_fraction = max(0.0, float(train_config.get('sweep_log_start_fraction', 0.20)))
+    log_start_max_steps = max(0, int(train_config.get('sweep_log_start_max_steps', 100_000_000)))
+    logging_threshold = min(log_start_fraction*train_config['total_timesteps'], log_start_max_steps)
     all_logs = []
 
     while pufferl.global_step < train_config['total_timesteps']:
