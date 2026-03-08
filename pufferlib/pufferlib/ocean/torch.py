@@ -295,6 +295,178 @@ class SingleSnakeV1Policy(nn.Module):
         value = self.value_fn(hidden)
         return action, value
 
+
+class SingleSnakeV1SplitPolicy(nn.Module):
+    def __init__(self, env, cnn_channels=24, hidden_size=96, **kwargs):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.is_continuous = False
+        self.obs_shape = env.single_observation_space.shape
+        self.num_obs_classes = int(np.max(env.single_observation_space.high)) + 1
+
+        self.backbone = nn.Sequential(
+            pufferlib.pytorch.layer_init(
+                nn.Conv2d(self.num_obs_classes, cnn_channels, kernel_size=3, padding=1)),
+            nn.GELU(),
+            pufferlib.pytorch.layer_init(
+                nn.Conv2d(cnn_channels, cnn_channels, kernel_size=3, padding=1)),
+            nn.GELU(),
+            nn.Flatten(),
+        )
+        with torch.no_grad():
+            dummy = torch.zeros(1, self.num_obs_classes, *self.obs_shape)
+            conv_dim = int(self.backbone(dummy).shape[-1])
+
+        self.actor_encoder = nn.Sequential(
+            pufferlib.pytorch.layer_init(nn.Linear(conv_dim, hidden_size)),
+            nn.GELU(),
+        )
+        self.value_encoder = nn.Sequential(
+            pufferlib.pytorch.layer_init(nn.Linear(conv_dim, hidden_size)),
+            nn.GELU(),
+        )
+        self.actor = pufferlib.pytorch.layer_init(
+            nn.Linear(hidden_size, env.single_action_space.n), std=0.01)
+        self.value_fn = pufferlib.pytorch.layer_init(
+            nn.Linear(hidden_size, 1), std=1)
+
+    def forward(self, observations, state=None):
+        hidden = self.encode_observations(observations)
+        actions, value = self.decode_actions(hidden)
+        return actions, value
+
+    def forward_eval(self, observations, state=None):
+        return self.forward(observations, state)
+
+    def forward_train(self, observations, state=None):
+        return self.forward(observations, state)
+
+    def encode_observations(self, observations, state=None):
+        observations = F.one_hot(
+            observations.long(), self.num_obs_classes).permute(0, 3, 1, 2).float()
+        return self.backbone(observations)
+
+    def decode_actions(self, hidden):
+        action = self.actor(self.actor_encoder(hidden))
+        value = self.value_fn(self.value_encoder(hidden))
+        return action, value
+
+
+class SingleSnakeV1MLPPolicy(nn.Module):
+    def __init__(self, env, hidden_size=128, **kwargs):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.is_continuous = False
+        self.obs_shape = env.single_observation_space.shape
+        self.num_obs_classes = int(np.max(env.single_observation_space.high)) + 1
+        flat_obs_dim = int(np.prod(self.obs_shape) * self.num_obs_classes)
+
+        self.encoder = nn.Sequential(
+            pufferlib.pytorch.layer_init(nn.Linear(flat_obs_dim, hidden_size)),
+            nn.GELU(),
+            pufferlib.pytorch.layer_init(nn.Linear(hidden_size, hidden_size)),
+            nn.GELU(),
+        )
+        self.actor = pufferlib.pytorch.layer_init(
+            nn.Linear(hidden_size, env.single_action_space.n), std=0.01)
+        self.value_fn = pufferlib.pytorch.layer_init(
+            nn.Linear(hidden_size, 1), std=1)
+
+    def forward(self, observations, state=None):
+        hidden = self.encode_observations(observations)
+        actions, value = self.decode_actions(hidden)
+        return actions, value
+
+    def forward_eval(self, observations, state=None):
+        return self.forward(observations, state)
+
+    def forward_train(self, observations, state=None):
+        return self.forward(observations, state)
+
+    def encode_observations(self, observations, state=None):
+        observations = F.one_hot(
+            observations.long(), self.num_obs_classes).reshape(observations.shape[0], -1).float()
+        return self.encoder(observations)
+
+    def decode_actions(self, hidden):
+        action = self.actor(hidden)
+        value = self.value_fn(hidden)
+        return action, value
+
+
+class SingleSnakeV1ResidualPolicy(nn.Module):
+    def __init__(self, env, cnn_channels=32, hidden_size=128, **kwargs):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.is_continuous = False
+        self.obs_shape = env.single_observation_space.shape
+        self.num_obs_classes = int(np.max(env.single_observation_space.high)) + 1
+
+        self.stem = nn.Sequential(
+            pufferlib.pytorch.layer_init(
+                nn.Conv2d(self.num_obs_classes, cnn_channels, kernel_size=3, padding=1)),
+            nn.GELU(),
+        )
+        self.block1 = nn.Sequential(
+            pufferlib.pytorch.layer_init(
+                nn.Conv2d(cnn_channels, cnn_channels, kernel_size=3, padding=1)),
+            nn.GELU(),
+            pufferlib.pytorch.layer_init(
+                nn.Conv2d(cnn_channels, cnn_channels, kernel_size=3, padding=1)),
+        )
+        self.block2 = nn.Sequential(
+            pufferlib.pytorch.layer_init(
+                nn.Conv2d(cnn_channels, cnn_channels, kernel_size=3, padding=1)),
+            nn.GELU(),
+            pufferlib.pytorch.layer_init(
+                nn.Conv2d(cnn_channels, cnn_channels, kernel_size=3, padding=1)),
+        )
+        self.activation = nn.GELU()
+        self.flatten = nn.Flatten()
+
+        with torch.no_grad():
+            dummy = torch.zeros(1, self.num_obs_classes, *self.obs_shape)
+            hidden = self._forward_backbone(dummy)
+            conv_dim = int(self.flatten(hidden).shape[-1])
+
+        self.encoder = nn.Sequential(
+            pufferlib.pytorch.layer_init(nn.Linear(conv_dim, hidden_size)),
+            nn.GELU(),
+        )
+        self.actor = pufferlib.pytorch.layer_init(
+            nn.Linear(hidden_size, env.single_action_space.n), std=0.01)
+        self.value_fn = pufferlib.pytorch.layer_init(
+            nn.Linear(hidden_size, 1), std=1)
+
+    def _forward_backbone(self, observations):
+        hidden = self.stem(observations)
+        hidden = self.activation(hidden + self.block1(hidden))
+        hidden = self.activation(hidden + self.block2(hidden))
+        return hidden
+
+    def forward(self, observations, state=None):
+        hidden = self.encode_observations(observations)
+        actions, value = self.decode_actions(hidden)
+        return actions, value
+
+    def forward_eval(self, observations, state=None):
+        return self.forward(observations, state)
+
+    def forward_train(self, observations, state=None):
+        return self.forward(observations, state)
+
+    def encode_observations(self, observations, state=None):
+        observations = F.one_hot(
+            observations.long(), self.num_obs_classes).permute(0, 3, 1, 2).float()
+        hidden = self._forward_backbone(observations)
+        hidden = self.flatten(hidden)
+        return self.encoder(hidden)
+
+    def decode_actions(self, hidden):
+        action = self.actor(hidden)
+        value = self.value_fn(hidden)
+        return action, value
+
 '''
 class Snake(pufferlib.models.Default):
     def __init__(self, env, hidden_size=128):

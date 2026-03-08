@@ -220,6 +220,9 @@ class PuffeRL:
         self.stats = defaultdict(list)
         self.last_stats = defaultdict(list)
         self.losses = {}
+        self.last_eval_s = 0.0
+        self.last_train_s = 0.0
+        self.last_update_s = 0.0
 
         # Dashboard
         self.model_size = sum(p.numel() for p in policy.parameters() if p.requires_grad)
@@ -237,6 +240,7 @@ class PuffeRL:
         return (self.global_step - self.last_log_step) / (time.time() - self.last_log_time)
 
     def evaluate(self):
+        tick = time.perf_counter()
         profile = self.profile
         epoch = self.epoch
         profile('eval', epoch)
@@ -336,10 +340,12 @@ class PuffeRL:
         self.ep_indices = torch.arange(self.total_agents, device=device, dtype=torch.int32)
         self.ep_lengths.zero_()
         profile.end()
+        self.last_eval_s = time.perf_counter() - tick
         return self.stats
 
     @record
     def train(self):
+        tick = time.perf_counter()
         profile = self.profile
         epoch = self.epoch
         profile('train', epoch)
@@ -353,22 +359,38 @@ class PuffeRL:
         clip_coef = config['clip_coef']
         vf_clip = config['vf_clip_coef']
         anneal_beta = b0 + (1 - b0)*a*self.epoch/self.total_epochs
+        recompute_advantages_per_minibatch = config.get('recompute_advantages_per_minibatch', True)
         self.ratio[:] = 1
+        advantages = None
+        returns = None
+
+        def refresh_advantages():
+            advantages = torch.zeros(self.values.shape, device=device)
+            advantages = compute_puff_advantage(
+                self.values,
+                self.rewards,
+                self.terminals,
+                self.ratio,
+                advantages,
+                config['gamma'],
+                config['gae_lambda'],
+                config['vtrace_rho_clip'],
+                config['vtrace_c_clip'],
+            )
+
+            adv = advantages.abs().sum(axis=1)
+            prio_weights = torch.nan_to_num(adv**a, 0, 0, 0)
+            prio_probs = (prio_weights + 1e-6)/(prio_weights.sum() + 1e-6)
+            returns = advantages + self.values
+            return advantages, returns, prio_probs
 
         for mb in range(self.total_minibatches):
             profile('train_misc', epoch)
             self.amp_context.__enter__()
 
-            shape = self.values.shape
-            advantages = torch.zeros(shape, device=device)
-            advantages = compute_puff_advantage(self.values, self.rewards,
-                self.terminals, self.ratio, advantages, config['gamma'],
-                config['gae_lambda'], config['vtrace_rho_clip'], config['vtrace_c_clip'])
+            if advantages is None or recompute_advantages_per_minibatch:
+                advantages, returns, prio_probs = refresh_advantages()
 
-            # Prioritize experience by advantage magnitude
-            adv = advantages.abs().sum(axis=1)
-            prio_weights = torch.nan_to_num(adv**a, 0, 0, 0)
-            prio_probs = (prio_weights + 1e-6)/(prio_weights.sum() + 1e-6)
             idx = torch.multinomial(prio_probs, self.minibatch_segments)
             mb_prio = (self.segments*prio_probs[idx, None])**-anneal_beta
 
@@ -381,7 +403,7 @@ class PuffeRL:
             mb_truncations = self.truncations[idx]
             mb_ratio = self.ratio[idx]
             mb_values = self.values[idx]
-            mb_returns = advantages[idx] + mb_values
+            mb_returns = returns[idx]
             mb_advantages = advantages[idx]
 
             profile('train_forward', epoch)
@@ -461,7 +483,7 @@ class PuffeRL:
             self.scheduler.step()
 
         y_pred = self.values.flatten()
-        y_true = advantages.flatten() + self.values.flatten()
+        y_true = returns.flatten()
         var_y = y_true.var()
         explained_var = torch.nan if var_y == 0 else (1 - (y_true - y_pred).var() / var_y).item()
         losses['explained_variance'] = explained_var
@@ -469,6 +491,8 @@ class PuffeRL:
         profile.end()
         logs = None
         self.epoch += 1
+        self.last_train_s = time.perf_counter() - tick
+        self.last_update_s = self.last_eval_s + self.last_train_s
         done_training = self.global_step >= config['total_timesteps']
         if done_training or self.global_step == 0 or time.time() > self.last_log_time + 0.25:
             logs = self.mean_and_log()
@@ -498,12 +522,44 @@ class PuffeRL:
 
         device = config['device']
         agent_steps = int(dist_sum(self.global_step, device))
+        update_s = self.last_update_s
+        eval_s = self.last_eval_s
+        train_s = self.last_train_s
+        updates_per_sec = 0.0 if update_s <= 0 else 1.0 / update_s
+        steps_per_update = config['batch_size']
+        eval_agent_sps = 0.0 if eval_s <= 0 else steps_per_update / eval_s
+        train_agent_sps = 0.0 if train_s <= 0 else steps_per_update / train_s
+        update_agent_sps = 0.0 if update_s <= 0 else steps_per_update / update_s
+        eval_frac = 0.0 if update_s <= 0 else eval_s / update_s
+        train_frac = 0.0 if update_s <= 0 else train_s / update_s
         logs = {
             'SPS': dist_sum(self.sps, device),
             'agent_steps': agent_steps,
             'uptime': time.time() - self.start_time,
             'epoch': int(dist_sum(self.epoch, device)),
             'learning_rate': self.optimizer.param_groups[0]["lr"],
+            'speed/eval_s': eval_s,
+            'speed/train_s': train_s,
+            'speed/update_s': update_s,
+            'speed/updates_per_sec': updates_per_sec,
+            'speed/steps_per_update': steps_per_update,
+            'speed/agents_per_update': steps_per_update,
+            'speed/eval_agent_sps': eval_agent_sps,
+            'speed/train_agent_sps': train_agent_sps,
+            'speed/update_agent_sps': update_agent_sps,
+            'speed/total_agents': self.total_agents,
+            'speed/batch_size': config['batch_size'],
+            'speed/bptt_horizon': config['bptt_horizon'],
+            'speed/minibatch_size': self.minibatch_size,
+            'speed/minibatch_segments': self.minibatch_segments,
+            'speed/total_minibatches': self.total_minibatches,
+            'speed/update_epochs': config['update_epochs'],
+            'speed/eval_fraction': eval_frac,
+            'speed/train_fraction': train_frac,
+            'speed/cpu_util_pct': float(np.mean(self.utilization.cpu_util)),
+            'speed/gpu_util_pct': float(np.mean(self.utilization.gpu_util)),
+            'speed/cpu_mem_pct': float(np.mean(self.utilization.cpu_mem)),
+            'speed/gpu_mem_pct': float(np.mean(self.utilization.gpu_mem)),
             **{f'environment/{k}': v for k, v in self.stats.items()},
             **{f'losses/{k}': v for k, v in self.losses.items()},
             **{f'performance/{k}': v['elapsed'] for k, v in self.profile},
@@ -1005,7 +1061,13 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None, early_stop
         }
         out = {}
         for k, v in logs.items():
-            if k in useful or k.startswith('environment/') or k.startswith('losses/'):
+            if (
+                k in useful
+                or k.startswith('environment/')
+                or k.startswith('losses/')
+                or k.startswith('speed/')
+                or k.startswith('performance/')
+            ):
                 out[k] = _to_jsonable(v)
         return out
 
