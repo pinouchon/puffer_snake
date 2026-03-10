@@ -103,6 +103,20 @@ def parse_args():
         help="Locked render and env step rate")
     parser.add_argument("--device", type=str, default=default_device(),
         help="Torch device, e.g. cuda or cpu")
+    parser.add_argument("--policy-name", type=str, default=None,
+        help="Override policy class name, e.g. SingleSnakeV1Policy")
+    parser.add_argument("--rnn-name", type=str, default=None,
+        help="Override recurrent wrapper class, e.g. SingleSnakeV1LSTM")
+    parser.add_argument("--policy-cnn-channels", type=int, default=None,
+        help="Override policy.cnn_channels")
+    parser.add_argument("--policy-hidden-size", type=int, default=None,
+        help="Override policy.hidden_size")
+    parser.add_argument("--env-width", type=int, default=None,
+        help="Override board width")
+    parser.add_argument("--env-height", type=int, default=None,
+        help="Override board height")
+    parser.add_argument("--env-max-episode-steps", type=int, default=None,
+        help="Override max episode steps")
     return parser.parse_args()
 
 
@@ -161,10 +175,37 @@ def load_runtime(device, checkpoint):
     args["env"]["num_envs"] = 1
     args["load_model_path"] = checkpoint
 
+    cli_args = parse_args()
+    if cli_args.policy_name is not None:
+        args["policy_name"] = cli_args.policy_name
+    if cli_args.rnn_name is not None:
+        args["rnn_name"] = cli_args.rnn_name
+    if cli_args.policy_cnn_channels is not None:
+        args["policy"]["cnn_channels"] = cli_args.policy_cnn_channels
+    if cli_args.policy_hidden_size is not None:
+        args["policy"]["hidden_size"] = cli_args.policy_hidden_size
+    if cli_args.env_width is not None:
+        args["env"]["width"] = cli_args.env_width
+    if cli_args.env_height is not None:
+        args["env"]["height"] = cli_args.env_height
+    if cli_args.env_max_episode_steps is not None:
+        args["env"]["max_episode_steps"] = cli_args.env_max_episode_steps
+
     vecenv = pufferl.load_env(ENV_NAME, args)
     policy = pufferl.load_policy(args, vecenv, ENV_NAME)
     policy.eval()
     return args, vecenv, policy
+
+
+def init_recurrent_state(policy, device):
+    hidden_size = getattr(policy, "hidden_size", None)
+    if hidden_size is None:
+        return {}
+
+    return {
+        "lstm_h": torch.zeros(1, hidden_size, device=device),
+        "lstm_c": torch.zeros(1, hidden_size, device=device),
+    }
 
 
 def format_screen(checkpoint, args, obs, episode_idx, episode_step, total_step,
@@ -202,6 +243,7 @@ def main():
     _, vecenv, policy = load_runtime(args.device, checkpoint)
     driver = vecenv.driver_env
     period = 1.0 / max(0.1, args.fps)
+    recurrent_state = init_recurrent_state(policy, args.device)
 
     obs, _ = vecenv.reset()
     episode_idx = 1
@@ -236,7 +278,7 @@ def main():
 
             with torch.no_grad():
                 obs_t = torch.as_tensor(obs, device=args.device)
-                logits, _ = policy.forward_eval(obs_t, {})
+                logits, _ = policy.forward_eval(obs_t, recurrent_state)
                 action, _, _ = pufferlib.pytorch.sample_logits(logits)
                 action = action.cpu().numpy().reshape(vecenv.action_space.shape)
 
@@ -270,6 +312,7 @@ def main():
             episode_return = 0.0
             last_reward = 0.0
             last_loop_s = 0.0
+            recurrent_state = init_recurrent_state(policy, args.device)
     finally:
         screen.leave()
         vecenv.close()

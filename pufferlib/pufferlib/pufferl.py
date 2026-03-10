@@ -121,7 +121,9 @@ class PuffeRL:
 
         # LSTM
         if config['use_rnn']:
-            n = vecenv.agents_per_batch
+            # Native PufferEnv backends do not expose agents_per_batch. In that
+            # case the whole native env batch is a single recurrent shard.
+            n = getattr(vecenv, 'agents_per_batch', total_agents)
             h = policy.hidden_size
             self.lstm_h = {i*n: torch.zeros(n, h, device=device) for i in range(total_agents//n)}
             self.lstm_c = {i*n: torch.zeros(n, h, device=device) for i in range(total_agents//n)}
@@ -1449,6 +1451,15 @@ def process_config(config, parser=None):
         if value.isnumeric(): return int(value)
         return float(value)
 
+    def nullable_type(default):
+        def parse(value):
+            if value == 'None':
+                return None
+            if default is None:
+                return value
+            return type(default)(value)
+        return parse
+
     for section in config.sections():
         for key in config[section]:
             try:
@@ -1460,7 +1471,7 @@ def process_config(config, parser=None):
             parser.add_argument(
                 fmt.replace('_', '-'),
                 default=value,
-                type=auto_type if value == 'auto' else type(value)
+                type=auto_type if value == 'auto' else nullable_type(value)
             )
 
     parser.add_argument('-h', '--help', default=argparse.SUPPRESS,

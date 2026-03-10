@@ -19,6 +19,79 @@ from pufferlib.pytorch import layer_init, _nativize_dtype, nativize_tensor
 import numpy as np
 
 
+class SingleSnakeV1LSTM(pufferlib.models.LSTMWrapper):
+    def __init__(self, env, policy, input_size=None, hidden_size=None):
+        input_size = policy.hidden_size if input_size is None else input_size
+        hidden_size = policy.hidden_size if hidden_size is None else hidden_size
+        super().__init__(env, policy, input_size=input_size, hidden_size=hidden_size)
+
+
+class SingleSnakeV1GRU(nn.Module):
+    def __init__(self, env, policy, input_size=None, hidden_size=None):
+        super().__init__()
+        self.obs_shape = env.single_observation_space.shape
+        self.policy = policy
+        self.input_size = policy.hidden_size if input_size is None else input_size
+        self.hidden_size = policy.hidden_size if hidden_size is None else hidden_size
+        self.is_continuous = self.policy.is_continuous
+
+        self.gru = nn.GRU(self.input_size, self.hidden_size)
+        self.cell = nn.GRUCell(self.input_size, self.hidden_size)
+        self.cell.weight_ih = self.gru.weight_ih_l0
+        self.cell.weight_hh = self.gru.weight_hh_l0
+        self.cell.bias_ih = self.gru.bias_ih_l0
+        self.cell.bias_hh = self.gru.bias_hh_l0
+
+    def forward_eval(self, observations, state):
+        hidden = self.policy.encode_observations(observations, state=state)
+        h = state['lstm_h']
+        if h is not None:
+            assert h.shape[0] == observations.shape[0], 'GRU state must match batch size'
+        hidden = self.cell(hidden, h)
+        state['hidden'] = hidden
+        state['lstm_h'] = hidden
+        state['lstm_c'] = torch.zeros_like(hidden)
+        logits, values = self.policy.decode_actions(hidden)
+        return logits, values
+
+    def forward(self, observations, state):
+        x = observations
+        lstm_h = state['lstm_h']
+
+        x_shape, space_shape = x.shape, self.obs_shape
+        x_n, space_n = len(x_shape), len(space_shape)
+        if x_shape[-space_n:] != space_shape:
+            raise ValueError('Invalid input tensor shape', x.shape)
+
+        if x_n == space_n + 1:
+            B, TT = x_shape[0], 1
+        elif x_n == space_n + 2:
+            B, TT = x_shape[:2]
+        else:
+            raise ValueError('Invalid input tensor shape', x.shape)
+
+        gru_state = None
+        if lstm_h is not None:
+            assert lstm_h.shape[1] == B, 'GRU state must match batch size'
+            gru_state = lstm_h
+
+        x = x.reshape(B*TT, *space_shape)
+        hidden = self.policy.encode_observations(x, state)
+        assert hidden.shape == (B*TT, self.input_size)
+
+        hidden = hidden.reshape(B, TT, self.input_size).transpose(0, 1)
+        hidden, gru_h = self.gru.forward(hidden, gru_state)
+        hidden = hidden.float().transpose(0, 1)
+
+        flat_hidden = hidden.reshape(B*TT, self.hidden_size)
+        logits, values = self.policy.decode_actions(flat_hidden)
+        values = values.reshape(B, TT)
+        state['hidden'] = hidden
+        state['lstm_h'] = gru_h.detach()
+        state['lstm_c'] = torch.zeros_like(gru_h)
+        return logits, values
+
+
 class Boids(nn.Module):
     def __init__(self, env, cnn_channels=32, hidden_size=128, **kwargs):
         super().__init__()
@@ -288,6 +361,154 @@ class SingleSnakeV1Policy(nn.Module):
         observations = F.one_hot(
             observations.long(), self.num_obs_classes).permute(0, 3, 1, 2).float()
         hidden = self.backbone(observations)
+        return self.encoder(hidden)
+
+    def decode_actions(self, hidden):
+        action = self.actor(hidden)
+        value = self.value_fn(hidden)
+        return action, value
+
+
+class _SnakeResidualBlock(nn.Module):
+    def __init__(self, channels, dilation=1):
+        super().__init__()
+        padding = dilation
+        self.conv1 = pufferlib.pytorch.layer_init(
+            nn.Conv2d(channels, channels, kernel_size=3, padding=padding, dilation=dilation))
+        self.conv2 = pufferlib.pytorch.layer_init(
+            nn.Conv2d(channels, channels, kernel_size=3, padding=padding, dilation=dilation))
+
+    def forward(self, x):
+        residual = x
+        x = F.gelu(self.conv1(x))
+        x = self.conv2(x)
+        return F.gelu(x + residual)
+
+
+class SingleSnakeV1ResidualPolicy(nn.Module):
+    def __init__(self, env, cnn_channels=32, hidden_size=128, num_blocks=6, **kwargs):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.is_continuous = False
+        self.obs_shape = env.single_observation_space.shape
+        self.num_obs_classes = int(np.max(env.single_observation_space.high)) + 1
+
+        blocks = []
+        for i in range(num_blocks):
+            dilation = 1 if i % 2 == 0 else 2
+            blocks.append(_SnakeResidualBlock(cnn_channels, dilation=dilation))
+
+        self.stem = nn.Sequential(
+            pufferlib.pytorch.layer_init(
+                nn.Conv2d(self.num_obs_classes, cnn_channels, kernel_size=3, padding=1)),
+            nn.GELU(),
+        )
+        self.backbone = nn.Sequential(*blocks)
+        self.proj = nn.Sequential(
+            nn.Flatten(),
+        )
+
+        with torch.no_grad():
+            dummy = torch.zeros(1, self.num_obs_classes, *self.obs_shape)
+            conv_dim = int(self.proj(self.backbone(self.stem(dummy))).shape[-1])
+
+        self.encoder = nn.Sequential(
+            pufferlib.pytorch.layer_init(nn.Linear(conv_dim, hidden_size)),
+            nn.GELU(),
+            pufferlib.pytorch.layer_init(nn.Linear(hidden_size, hidden_size)),
+            nn.GELU(),
+        )
+        self.actor = pufferlib.pytorch.layer_init(
+            nn.Linear(hidden_size, env.single_action_space.n), std=0.01)
+        self.value_fn = pufferlib.pytorch.layer_init(
+            nn.Linear(hidden_size, 1), std=1)
+
+    def forward(self, observations, state=None):
+        hidden = self.encode_observations(observations)
+        actions, value = self.decode_actions(hidden)
+        return actions, value
+
+    def forward_eval(self, observations, state=None):
+        return self.forward(observations, state)
+
+    def forward_train(self, observations, state=None):
+        return self.forward(observations, state)
+
+    def encode_observations(self, observations, state=None):
+        observations = F.one_hot(
+            observations.long(), self.num_obs_classes).permute(0, 3, 1, 2).float()
+        hidden = self.stem(observations)
+        hidden = self.backbone(hidden)
+        hidden = self.proj(hidden)
+        return self.encoder(hidden)
+
+    def decode_actions(self, hidden):
+        action = self.actor(hidden)
+        value = self.value_fn(hidden)
+        return action, value
+
+
+class SingleSnakeV1CoordPolicy(nn.Module):
+    def __init__(self, env, cnn_channels=32, hidden_size=128, num_blocks=4, **kwargs):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.is_continuous = False
+        self.obs_shape = env.single_observation_space.shape
+        self.num_obs_classes = int(np.max(env.single_observation_space.high)) + 1
+
+        height, width = self.obs_shape
+        yy, xx = torch.meshgrid(
+            torch.linspace(-1.0, 1.0, height),
+            torch.linspace(-1.0, 1.0, width),
+            indexing='ij')
+        self.register_buffer('coord_channels', torch.stack([yy, xx], dim=0))
+
+        self.stem = nn.Sequential(
+            pufferlib.pytorch.layer_init(
+                nn.Conv2d(self.num_obs_classes + 2, cnn_channels, kernel_size=5, padding=2)),
+            nn.GELU(),
+        )
+        self.blocks = nn.Sequential(*[
+            _SnakeResidualBlock(cnn_channels, dilation=1 if i < 2 else 2)
+            for i in range(num_blocks)
+        ])
+        self.pool = nn.AdaptiveAvgPool2d((4, 4))
+
+        with torch.no_grad():
+            dummy = torch.zeros(1, self.num_obs_classes, *self.obs_shape)
+            conv_in = torch.cat([dummy, self.coord_channels.unsqueeze(0)], dim=1)
+            conv_dim = int(self.pool(self.blocks(self.stem(conv_in))).numel())
+
+        self.encoder = nn.Sequential(
+            pufferlib.pytorch.layer_init(nn.Linear(conv_dim, hidden_size)),
+            nn.GELU(),
+            pufferlib.pytorch.layer_init(nn.Linear(hidden_size, hidden_size)),
+            nn.GELU(),
+        )
+        self.actor = pufferlib.pytorch.layer_init(
+            nn.Linear(hidden_size, env.single_action_space.n), std=0.01)
+        self.value_fn = pufferlib.pytorch.layer_init(
+            nn.Linear(hidden_size, 1), std=1)
+
+    def forward(self, observations, state=None):
+        hidden = self.encode_observations(observations)
+        actions, value = self.decode_actions(hidden)
+        return actions, value
+
+    def forward_eval(self, observations, state=None):
+        return self.forward(observations, state)
+
+    def forward_train(self, observations, state=None):
+        return self.forward(observations, state)
+
+    def encode_observations(self, observations, state=None):
+        observations = F.one_hot(
+            observations.long(), self.num_obs_classes).permute(0, 3, 1, 2).float()
+        coords = self.coord_channels.unsqueeze(0).expand(observations.shape[0], -1, -1, -1)
+        hidden = torch.cat([observations, coords], dim=1)
+        hidden = self.stem(hidden)
+        hidden = self.blocks(hidden)
+        hidden = self.pool(hidden).flatten(start_dim=1)
         return self.encoder(hidden)
 
     def decode_actions(self, hidden):
